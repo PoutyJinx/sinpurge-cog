@@ -1,4 +1,3 @@
-import asyncio
 import random
 import re
 from datetime import datetime, timedelta, timezone
@@ -7,25 +6,26 @@ from typing import Iterable, List, Optional, Tuple
 import discord
 from discord import app_commands
 from redbot.core import commands
+from redbot.core.utils.chat_formatting import box
 
 
 TIME_RE = re.compile(r"^(\d+)\s*(m|h|d)$", re.IGNORECASE)
-MAX_PURGE_WINDOW = timedelta(days=14)
-ALL_CHANNEL_WORDS = {"true", "all", "yes", "y", "server", "global", "everywhere"}
-CURRENT_CHANNEL_WORDS = {"false", "current", "channel", "here", "no", "n"}
+ALL_KEYWORDS = {"true", "all", "yes", "y", "server", "global", "guild"}
+CURRENT_KEYWORDS = {"false", "current", "channel", "here", "no", "n"}
 
 
 class SinPurge(commands.Cog):
-    """SIN Corporation user purge tool."""
+    """SIN Corporation moderation tool for purging a user's recent messages."""
 
     def __init__(self, bot):
         self.bot = bot
 
-    @staticmethod
-    def parse_timeframe(value: str) -> timedelta:
+    # ---------- Helpers ----------
+
+    def parse_timeframe(self, value: str) -> timedelta:
         match = TIME_RE.match(value.strip())
         if not match:
-            raise ValueError("Invalid timeframe. Use `30m`, `1h`, `5h`, `2d`, etc.")
+            raise ValueError("Invalid timeframe. Use `30m`, `1h`, `5h`, `1d`, etc.")
 
         amount = int(match.group(1))
         unit = match.group(2).lower()
@@ -42,241 +42,199 @@ class SinPurge(commands.Cog):
         else:
             raise ValueError("Invalid timeframe unit. Use `m`, `h`, or `d`.")
 
-        if delta > MAX_PURGE_WINDOW:
-            raise ValueError("Discord bulk deletion is limited to messages newer than 14 days. Use `14d` or less.")
+        if delta > timedelta(days=14):
+            raise ValueError("Discord only allows reliable cleanup within the last 14 days. Use `14d` or less.")
 
         return delta
 
-    @staticmethod
-    def clean_user_input(value: str) -> str:
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1].strip()
-        return value
+    def parse_scope(self, value: Optional[str]) -> bool:
+        """Return True for all-channel scan, False for current-channel only."""
+        if value is None:
+            return False
 
-    def parse_prefix_args(self, args: str) -> Tuple[str, str, bool]:
-        parts = args.strip().split()
-        if len(parts) < 2:
-            raise ValueError(
-                "Usage: `!sinpurge @User 1h`, `!sinpurge Username 1h`, or `!sinpurge Username 1h all`."
-            )
+        cleaned = value.strip().lower()
+        if cleaned in ALL_KEYWORDS:
+            return True
+        if cleaned in CURRENT_KEYWORDS:
+            return False
 
-        all_channels = False
-        last = parts[-1].lower()
+        raise ValueError("Invalid scope. Use `all`/`true` for all channels, or leave it empty for current channel only.")
 
-        if last in ALL_CHANNEL_WORDS:
-            all_channels = True
-            parts.pop()
-        elif last in CURRENT_CHANNEL_WORDS:
-            all_channels = False
-            parts.pop()
+    async def resolve_member(self, ctx: commands.Context, user_text: str) -> discord.Member:
+        """Resolve member from mention, ID, username, nickname, or spaced display name."""
+        text = user_text.strip()
 
-        if len(parts) < 2:
-            raise ValueError("Missing user or timeframe. Example: `!sinpurge @User 1h all`.")
-
-        timeframe = parts[-1]
-        self.parse_timeframe(timeframe)
-
-        target_query = self.clean_user_input(" ".join(parts[:-1]))
-        if not target_query:
-            raise ValueError("Missing user. Example: `!sinpurge @User 1h`.")
-
-        return target_query, timeframe, all_channels
-
-    async def resolve_member(self, ctx: commands.Context, query: str) -> discord.Member:
-        guild = ctx.guild
-        if guild is None:
-            raise commands.BadArgument("This command only works inside a server.")
-
-        query = self.clean_user_input(query)
-
+        # First use Discord.py's converter. This handles mentions, IDs, exact names, and many nickname cases.
         try:
-            return await commands.MemberConverter().convert(ctx, query)
+            return await commands.MemberConverter().convert(ctx, text)
         except commands.BadArgument:
             pass
 
-        if query.isdigit():
-            member = guild.get_member(int(query))
-            if member:
-                return member
+        # Fallback: case-insensitive exact matching for display name/name/global name.
+        lowered = text.lower()
+        matches = []
+        for member in ctx.guild.members:
+            names = {
+                member.name.lower(),
+                member.display_name.lower(),
+            }
+            if getattr(member, "global_name", None):
+                names.add(member.global_name.lower())
 
-            try:
-                member = await guild.fetch_member(int(query))
-                if member:
-                    return member
-            except (discord.NotFound, discord.HTTPException, discord.Forbidden):
-                pass
+            if lowered in names:
+                matches.append(member)
 
-        lowered = query.lower()
-        exact_matches = [
-            member for member in guild.members
-            if member.display_name.lower() == lowered
-            or member.name.lower() == lowered
-            or str(member).lower() == lowered
-            or member.global_name and member.global_name.lower() == lowered
-        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise commands.BadArgument(
+                "Multiple members match that name. Use a mention or user ID instead."
+            )
 
-        if len(exact_matches) == 1:
-            return exact_matches[0]
-        if len(exact_matches) > 1:
-            names = ", ".join(member.display_name for member in exact_matches[:5])
-            raise commands.BadArgument(f"Multiple members matched `{query}`: {names}. Use their ID or mention instead.")
+        raise commands.BadArgument(
+            f'Member "{user_text}" not found. Try mentioning them, using their full display name, or using their user ID.'
+        )
 
-        partial_matches = [
-            member for member in guild.members
-            if lowered in member.display_name.lower()
-            or lowered in member.name.lower()
-            or member.global_name and lowered in member.global_name.lower()
-        ]
+    def build_channel_list(self, guild: discord.Guild, announce_channel, all_channels: bool) -> List[discord.abc.GuildChannel]:
+        """Include normal text channels, forum channels where supported, and voice-channel text chats."""
+        if not all_channels:
+            return [announce_channel]
 
-        if len(partial_matches) == 1:
-            return partial_matches[0]
-        if len(partial_matches) > 1:
-            names = ", ".join(member.display_name for member in partial_matches[:5])
-            raise commands.BadArgument(f"Multiple members matched `{query}`: {names}. Use their ID or mention instead.")
+        channels: List[discord.abc.GuildChannel] = []
+        channels.extend(guild.text_channels)
 
-        raise commands.BadArgument(f"Member `{query}` not found. Try a mention, exact username, nickname, or user ID.")
+        # Voice channels can have text chat/history in Discord. They are not part of guild.text_channels.
+        channels.extend(guild.voice_channels)
 
-    @staticmethod
-    def lore_message(target: discord.Member, deleted: int) -> str:
+        # Some Red/discord.py versions expose forum channels. We include them if available.
+        forum_channels = getattr(guild, "forum_channels", [])
+        channels.extend(forum_channels)
+
+        # Remove duplicates while preserving order.
+        seen = set()
+        unique = []
+        for channel in channels:
+            channel_id = getattr(channel, "id", None)
+            if channel_id is not None and channel_id not in seen:
+                seen.add(channel_id)
+                unique.append(channel)
+
+        return unique
+
+    def channel_supports_history(self, channel) -> bool:
+        return hasattr(channel, "history") and hasattr(channel, "permissions_for")
+
+    def lore_message(self, target: discord.Member, deleted: int) -> str:
         messages = [
-            "SIN Corporation has audited {user}. `{count}` suspicious memos were shredded.",
-            "{user} has been escorted out of the Castle. `{count}` messages mysteriously vanished.",
-            "CEO Jinx has reviewed the paperwork. {user} failed the vibe check. `{count}` messages deleted.",
-            "A Dweller cleanup crew swept away `{count}` pieces of nonsense from {user}.",
-            "{user} has been transferred to the Department of Consequences. `{count}` messages purged.",
-            "SIN Corp Security bonked {user} with the compliance clipboard. `{count}` messages removed.",
-            "The shredder demanded tribute. {user} provided `{count}` messages.",
-            "Audit complete. {user}'s spam portfolio has lost `{count}` assets.",
+            "SIN Corporation has audited {user}. {count} suspicious memo(s) were shredded.",
+            "{user} has been escorted out of the Castle. {count} message(s) mysteriously vanished.",
+            "CEO Jinx reviewed the paperwork. {user} failed the vibe check. {count} message(s) deleted.",
+            "A Dweller cleanup crew swept away {count} piece(s) of nonsense from {user}.",
+            "{user} has been transferred to the Department of Consequences. {count} message(s) purged.",
+            "SIN Corp Security bonked {user} with the compliance clipboard. {count} message(s) removed.",
         ]
         return random.choice(messages).format(user=target.mention, count=deleted)
 
-    @staticmethod
-    def can_use_against(ctx_author: discord.Member, target: discord.Member) -> Tuple[bool, str]:
-        guild = ctx_author.guild
-
-        if target == ctx_author:
+    def can_target_member(self, guild: discord.Guild, moderator: discord.Member, target: discord.Member) -> Tuple[bool, str]:
+        if target == moderator:
             return False, "You cannot purge yourself. That paperwork is cursed."
 
         if target == guild.owner:
             return False, "The server owner is protected by forbidden HR magic."
 
-        if ctx_author != guild.owner and target.top_role >= ctx_author.top_role:
+        if target.top_role >= moderator.top_role and moderator != guild.owner:
             return False, "You cannot purge someone with an equal or higher role."
 
         return True, ""
 
-    @staticmethod
-    def chunk_messages(messages: List[discord.Message], size: int = 100) -> Iterable[List[discord.Message]]:
-        for index in range(0, len(messages), size):
-            yield messages[index:index + size]
-
-    async def safe_delete_batch(self, channel: discord.TextChannel, messages: List[discord.Message]) -> int:
+    async def safe_delete_batch(self, channel, messages: List[discord.Message]) -> int:
         if not messages:
             return 0
 
-        deleted = 0
-
-        for batch in self.chunk_messages(messages, 100):
-            try:
-                if len(batch) == 1:
-                    await batch[0].delete()
-                    deleted += 1
-                else:
-                    await channel.delete_messages(batch)
-                    deleted += len(batch)
-
-                await asyncio.sleep(0.5)
-
-            except discord.HTTPException:
-                for message in batch:
-                    try:
-                        await message.delete()
-                        deleted += 1
-                        await asyncio.sleep(0.15)
-                    except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                        pass
-            except discord.Forbidden:
-                pass
-
-        return deleted
-
-    async def purge_in_channel(
-        self,
-        channel: discord.TextChannel,
-        moderator: discord.Member,
-        target: discord.Member,
-        after_time: datetime,
-    ) -> Tuple[int, bool]:
-        guild = channel.guild
-        bot_member = guild.me
-
-        if bot_member is None:
-            return 0, False
-
-        bot_perms = channel.permissions_for(bot_member)
-        mod_perms = channel.permissions_for(moderator)
-
-        if not (bot_perms.view_channel and bot_perms.read_message_history and bot_perms.manage_messages):
-            return 0, False
-
-        if not mod_perms.manage_messages:
-            return 0, False
-
-        matched_messages: List[discord.Message] = []
-        total_deleted = 0
-
         try:
-            async for message in channel.history(limit=None, after=after_time, oldest_first=False):
-                if message.author.id != target.id:
-                    continue
+            if len(messages) == 1:
+                await messages[0].delete()
+                return 1
 
-                matched_messages.append(message)
+            await channel.delete_messages(messages)
+            return len(messages)
+        except (discord.HTTPException, discord.Forbidden):
+            deleted = 0
+            for msg in messages:
+                try:
+                    await msg.delete()
+                    deleted += 1
+                except (discord.HTTPException, discord.Forbidden):
+                    pass
+            return deleted
 
-                if len(matched_messages) >= 100:
-                    total_deleted += await self.safe_delete_batch(channel, matched_messages)
-                    matched_messages = []
-
-            if matched_messages:
-                total_deleted += await self.safe_delete_batch(channel, matched_messages)
-
-            return total_deleted, True
-
-        except (discord.Forbidden, discord.HTTPException):
-            return total_deleted, total_deleted > 0
-
-    async def run_purge(
+    async def purge_user_messages(
         self,
         guild: discord.Guild,
         moderator: discord.Member,
         target: discord.Member,
         timeframe: str,
         all_channels: bool,
-        source_channel: discord.abc.Messageable,
+        announce_channel,
     ) -> Tuple[int, int, int]:
         delta = self.parse_timeframe(timeframe)
         after_time = datetime.now(timezone.utc) - delta
 
-        if all_channels:
-            channels = list(guild.text_channels)
-        else:
-            if not isinstance(source_channel, discord.TextChannel):
-                raise ValueError("This command can only purge the current channel unless `all` is enabled from a normal text channel.")
-            channels = [source_channel]
+        channels = self.build_channel_list(guild, announce_channel, all_channels)
 
         total_deleted = 0
         scanned_channels = 0
         skipped_channels = 0
 
         for channel in channels:
-            deleted, scanned = await self.purge_in_channel(channel, moderator, target, after_time)
-            if scanned:
-                scanned_channels += 1
-                total_deleted += deleted
-            else:
+            if not self.channel_supports_history(channel):
+                skipped_channels += 1
+                continue
+
+            try:
+                bot_perms = channel.permissions_for(guild.me)
+                mod_perms = channel.permissions_for(moderator)
+            except Exception:
+                skipped_channels += 1
+                continue
+
+            if not bot_perms.view_channel or not bot_perms.read_message_history or not bot_perms.manage_messages:
+                skipped_channels += 1
+                continue
+
+            if not mod_perms.view_channel or not mod_perms.manage_messages:
+                skipped_channels += 1
+                continue
+
+            scanned_channels += 1
+            batch: List[discord.Message] = []
+
+            try:
+                async for message in channel.history(limit=None, after=after_time, oldest_first=False):
+                    if message.author.id == target.id:
+                        batch.append(message)
+
+                        if len(batch) >= 100:
+                            total_deleted += await self.safe_delete_batch(channel, batch)
+                            batch = []
+
+                if batch:
+                    total_deleted += await self.safe_delete_batch(channel, batch)
+
+            except (discord.Forbidden, discord.HTTPException):
+                skipped_channels += 1
+            except Exception:
                 skipped_channels += 1
 
+        if total_deleted > 0:
+            try:
+                await announce_channel.send(self.lore_message(target, total_deleted))
+            except (discord.HTTPException, discord.Forbidden):
+                pass
+
         return total_deleted, scanned_channels, skipped_channels
+
+    # ---------- Prefix command ----------
 
     @commands.guild_only()
     @commands.mod_or_permissions(manage_messages=True)
@@ -284,59 +242,83 @@ class SinPurge(commands.Cog):
     @commands.command(name="sinpurge", aliases=["purgeuser", "userpurge"])
     async def sinpurge_prefix(self, ctx: commands.Context, *, args: str):
         """
-        Purge recent messages from a specific user.
+        Purge recent messages from a user.
 
         Examples:
-        [p]sinpurge @user 1h
-        [p]sinpurge username 1h all
+        [p]sinpurge @User 1h
+        [p]sinpurge Username 1h
         [p]sinpurge User With Spaces 1h
         [p]sinpurge 123456789012345678 1h all
+        [p]sinpurge @User 5h true
         """
-        if not ctx.guild or not isinstance(ctx.author, discord.Member):
-            return await ctx.send("This command only works inside a server.")
+        parts = args.rsplit(maxsplit=2)
+
+        if len(parts) < 2:
+            return await ctx.send(
+                "Usage: `!sinpurge @User 1h` or `!sinpurge User With Spaces 1h all`"
+            )
+
+        if len(parts) == 2:
+            user_text, timeframe = parts
+            scope_text = None
+        else:
+            possible_user_text, possible_timeframe, possible_scope = parts
+            if possible_scope.lower() in ALL_KEYWORDS or possible_scope.lower() in CURRENT_KEYWORDS:
+                user_text = possible_user_text
+                timeframe = possible_timeframe
+                scope_text = possible_scope
+            else:
+                # Allows names with two last words before timeframe, fallback format.
+                user_text = f"{possible_user_text} {possible_timeframe}"
+                timeframe = possible_scope
+                scope_text = None
 
         try:
-            target_query, timeframe, all_channels = self.parse_prefix_args(args)
-            target = await self.resolve_member(ctx, target_query)
-        except (ValueError, commands.BadArgument) as error:
-            return await ctx.send(str(error))
+            all_channels = self.parse_scope(scope_text)
+            self.parse_timeframe(timeframe)
+        except ValueError as e:
+            return await ctx.send(str(e))
 
-        allowed, reason = self.can_use_against(ctx.author, target)
+        try:
+            target = await self.resolve_member(ctx, user_text)
+        except commands.BadArgument as e:
+            return await ctx.send(str(e))
+
+        allowed, reason = self.can_target_member(ctx.guild, ctx.author, target)
         if not allowed:
             return await ctx.send(reason)
 
+        scope_msg = "all accessible text and voice-channel chats" if all_channels else "this channel"
         await ctx.send(
-            f"SIN Corp audit started for {target.mention}. "
-            f"Searching the last `{timeframe}` "
-            f"in {'all visible text channels' if all_channels else 'this channel'}."
+            f"SIN Corp audit started for {target.mention}. Searching the last `{timeframe}` in {scope_msg}."
         )
 
         try:
-            deleted, scanned, skipped = await self.run_purge(
+            deleted, scanned, skipped = await self.purge_user_messages(
                 guild=ctx.guild,
                 moderator=ctx.author,
                 target=target,
                 timeframe=timeframe,
                 all_channels=all_channels,
-                source_channel=ctx.channel,
+                announce_channel=ctx.channel,
             )
-        except ValueError as error:
-            return await ctx.send(str(error))
-
-        if deleted > 0:
-            await ctx.send(self.lore_message(target, deleted))
-        else:
-            await ctx.send(f"Audit complete. No recent messages from {target.mention} were found.")
+        except ValueError as e:
+            return await ctx.send(str(e))
 
         await ctx.send(
-            f"Deleted `{deleted}` messages. Scanned `{scanned}` channel(s). Skipped `{skipped}` channel(s)."
+            f"Deleted `{deleted}` message(s). Scanned `{scanned}` channel(s). Skipped `{skipped}` channel(s)."
         )
 
-    @app_commands.command(name="sinpurge", description="Purge recent messages from a specific user.")
+    # ---------- Slash command ----------
+
+    @app_commands.command(
+        name="sinpurge",
+        description="Purge recent messages from a specific user."
+    )
     @app_commands.describe(
-        target="The user whose recent messages should be purged.",
-        timeframe="Time range. Max 14d.",
-        all_channels="Scan all text channels instead of only this channel."
+        user="The user to purge.",
+        timeframe="How far back to search. Max 14 days.",
+        scope="Current channel only, or all accessible channels including voice-channel chats."
     )
     @app_commands.choices(
         timeframe=[
@@ -347,52 +329,67 @@ class SinPurge(commands.Cog):
             app_commands.Choice(name="Last 1 day", value="1d"),
             app_commands.Choice(name="Last 7 days", value="7d"),
             app_commands.Choice(name="Last 14 days", value="14d"),
+        ],
+        scope=[
+            app_commands.Choice(name="Current channel only", value="current"),
+            app_commands.Choice(name="All accessible channels", value="all"),
         ]
     )
     async def sinpurge_slash(
         self,
         interaction: discord.Interaction,
-        target: discord.Member,
+        user: discord.Member,
         timeframe: app_commands.Choice[str],
-        all_channels: bool = False,
+        scope: app_commands.Choice[str],
     ):
         guild = interaction.guild
         moderator = interaction.user
 
-        if guild is None or not isinstance(moderator, discord.Member):
-            return await interaction.response.send_message("This command only works inside a server.", ephemeral=True)
+        if guild is None:
+            return await interaction.response.send_message(
+                "This command only works inside a server.",
+                ephemeral=True,
+            )
+
+        if not isinstance(moderator, discord.Member):
+            return await interaction.response.send_message(
+                "Could not verify your server permissions.",
+                ephemeral=True,
+            )
 
         if not moderator.guild_permissions.manage_messages:
-            return await interaction.response.send_message("You need `Manage Messages` to use this SIN Corp tool.", ephemeral=True)
+            return await interaction.response.send_message(
+                "You need `Manage Messages` to use this SIN Corp tool.",
+                ephemeral=True,
+            )
 
-        if guild.me is None or not guild.me.guild_permissions.manage_messages:
-            return await interaction.response.send_message("I need `Manage Messages` to purge anything.", ephemeral=True)
+        if not guild.me.guild_permissions.manage_messages:
+            return await interaction.response.send_message(
+                "I need `Manage Messages` to purge anything.",
+                ephemeral=True,
+            )
 
-        allowed, reason = self.can_use_against(moderator, target)
+        allowed, reason = self.can_target_member(guild, moderator, user)
         if not allowed:
             return await interaction.response.send_message(reason, ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
 
+        all_channels = scope.value == "all"
+
         try:
-            deleted, scanned, skipped = await self.run_purge(
+            deleted, scanned, skipped = await self.purge_user_messages(
                 guild=guild,
                 moderator=moderator,
-                target=target,
+                target=user,
                 timeframe=timeframe.value,
                 all_channels=all_channels,
-                source_channel=interaction.channel,
+                announce_channel=interaction.channel,
             )
-        except ValueError as error:
-            return await interaction.followup.send(str(error), ephemeral=True)
-
-        if deleted > 0 and interaction.channel is not None:
-            try:
-                await interaction.channel.send(self.lore_message(target, deleted))
-            except discord.HTTPException:
-                pass
+        except ValueError as e:
+            return await interaction.followup.send(str(e), ephemeral=True)
 
         await interaction.followup.send(
-            f"SIN Corp audit complete. Deleted `{deleted}` messages. Scanned `{scanned}` channel(s). Skipped `{skipped}` channel(s).",
+            f"SIN Corp audit complete. Deleted `{deleted}` message(s). Scanned `{scanned}` channel(s). Skipped `{skipped}` channel(s).",
             ephemeral=True,
         )
