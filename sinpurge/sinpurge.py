@@ -11,6 +11,8 @@ from redbot.core import commands
 
 TIME_RE = re.compile(r"^(\d+)\s*(m|h|d)$", re.IGNORECASE)
 MAX_PURGE_WINDOW = timedelta(days=14)
+ALL_CHANNEL_WORDS = {"true", "all", "yes", "y", "server", "global", "everywhere"}
+CURRENT_CHANNEL_WORDS = {"false", "current", "channel", "here", "no", "n"}
 
 
 class SinPurge(commands.Cog):
@@ -21,7 +23,6 @@ class SinPurge(commands.Cog):
 
     @staticmethod
     def parse_timeframe(value: str) -> timedelta:
-        """Turn values like 30m, 1h, 5h, 2d into a timedelta."""
         match = TIME_RE.match(value.strip())
         if not match:
             raise ValueError("Invalid timeframe. Use `30m`, `1h`, `5h`, `2d`, etc.")
@@ -45,6 +46,96 @@ class SinPurge(commands.Cog):
             raise ValueError("Discord bulk deletion is limited to messages newer than 14 days. Use `14d` or less.")
 
         return delta
+
+    @staticmethod
+    def clean_user_input(value: str) -> str:
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1].strip()
+        return value
+
+    def parse_prefix_args(self, args: str) -> Tuple[str, str, bool]:
+        parts = args.strip().split()
+        if len(parts) < 2:
+            raise ValueError(
+                "Usage: `!sinpurge @User 1h`, `!sinpurge Username 1h`, or `!sinpurge Username 1h all`."
+            )
+
+        all_channels = False
+        last = parts[-1].lower()
+
+        if last in ALL_CHANNEL_WORDS:
+            all_channels = True
+            parts.pop()
+        elif last in CURRENT_CHANNEL_WORDS:
+            all_channels = False
+            parts.pop()
+
+        if len(parts) < 2:
+            raise ValueError("Missing user or timeframe. Example: `!sinpurge @User 1h all`.")
+
+        timeframe = parts[-1]
+        self.parse_timeframe(timeframe)
+
+        target_query = self.clean_user_input(" ".join(parts[:-1]))
+        if not target_query:
+            raise ValueError("Missing user. Example: `!sinpurge @User 1h`.")
+
+        return target_query, timeframe, all_channels
+
+    async def resolve_member(self, ctx: commands.Context, query: str) -> discord.Member:
+        guild = ctx.guild
+        if guild is None:
+            raise commands.BadArgument("This command only works inside a server.")
+
+        query = self.clean_user_input(query)
+
+        try:
+            return await commands.MemberConverter().convert(ctx, query)
+        except commands.BadArgument:
+            pass
+
+        if query.isdigit():
+            member = guild.get_member(int(query))
+            if member:
+                return member
+
+            try:
+                member = await guild.fetch_member(int(query))
+                if member:
+                    return member
+            except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+                pass
+
+        lowered = query.lower()
+        exact_matches = [
+            member for member in guild.members
+            if member.display_name.lower() == lowered
+            or member.name.lower() == lowered
+            or str(member).lower() == lowered
+            or member.global_name and member.global_name.lower() == lowered
+        ]
+
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+        if len(exact_matches) > 1:
+            names = ", ".join(member.display_name for member in exact_matches[:5])
+            raise commands.BadArgument(f"Multiple members matched `{query}`: {names}. Use their ID or mention instead.")
+
+        partial_matches = [
+            member for member in guild.members
+            if lowered in member.display_name.lower()
+            or lowered in member.name.lower()
+            or member.global_name and lowered in member.global_name.lower()
+        ]
+
+        if len(partial_matches) == 1:
+            return partial_matches[0]
+        if len(partial_matches) > 1:
+            names = ", ".join(member.display_name for member in partial_matches[:5])
+            raise commands.BadArgument(f"Multiple members matched `{query}`: {names}. Use their ID or mention instead.")
+
+        raise commands.BadArgument(f"Member `{query}` not found. Try a mention, exact username, nickname, or user ID.")
 
     @staticmethod
     def lore_message(target: discord.Member, deleted: int) -> str:
@@ -81,7 +172,6 @@ class SinPurge(commands.Cog):
             yield messages[index:index + size]
 
     async def safe_delete_batch(self, channel: discord.TextChannel, messages: List[discord.Message]) -> int:
-        """Delete messages in a safe way, falling back to individual deletes if needed."""
         if not messages:
             return 0
 
@@ -118,7 +208,6 @@ class SinPurge(commands.Cog):
         target: discord.Member,
         after_time: datetime,
     ) -> Tuple[int, bool]:
-        """Return deleted count and whether this channel was scanned."""
         guild = channel.guild
         bot_member = guild.me
 
@@ -135,20 +224,26 @@ class SinPurge(commands.Cog):
             return 0, False
 
         matched_messages: List[discord.Message] = []
+        total_deleted = 0
 
         try:
             async for message in channel.history(limit=None, after=after_time, oldest_first=False):
-                if message.author.id == target.id:
-                    matched_messages.append(message)
+                if message.author.id != target.id:
+                    continue
+
+                matched_messages.append(message)
 
                 if len(matched_messages) >= 100:
-                    break
+                    total_deleted += await self.safe_delete_batch(channel, matched_messages)
+                    matched_messages = []
 
-            deleted = await self.safe_delete_batch(channel, matched_messages)
-            return deleted, True
+            if matched_messages:
+                total_deleted += await self.safe_delete_batch(channel, matched_messages)
+
+            return total_deleted, True
 
         except (discord.Forbidden, discord.HTTPException):
-            return 0, False
+            return total_deleted, total_deleted > 0
 
     async def run_purge(
         self,
@@ -166,7 +261,7 @@ class SinPurge(commands.Cog):
             channels = list(guild.text_channels)
         else:
             if not isinstance(source_channel, discord.TextChannel):
-                raise ValueError("This command can only purge the current channel unless `all_channels` is enabled from a normal text channel.")
+                raise ValueError("This command can only purge the current channel unless `all` is enabled from a normal text channel.")
             channels = [source_channel]
 
         total_deleted = 0
@@ -186,59 +281,35 @@ class SinPurge(commands.Cog):
     @commands.guild_only()
     @commands.mod_or_permissions(manage_messages=True)
     @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
-    @commands.hybrid_command(name="sinpurge", aliases=["purgeuser", "userpurge"])
-    @app_commands.describe(
-        target="The user whose recent messages should be purged.",
-        timeframe="Time range like 30m, 1h, 5h, 2d. Max 14d.",
-        all_channels="True = scan all text channels. False = only this channel."
-    )
-    @app_commands.choices(
-        timeframe=[
-            app_commands.Choice(name="Last 30 minutes", value="30m"),
-            app_commands.Choice(name="Last 1 hour", value="1h"),
-            app_commands.Choice(name="Last 5 hours", value="5h"),
-            app_commands.Choice(name="Last 12 hours", value="12h"),
-            app_commands.Choice(name="Last 1 day", value="1d"),
-            app_commands.Choice(name="Last 7 days", value="7d"),
-            app_commands.Choice(name="Last 14 days", value="14d"),
-        ]
-    )
-    async def sinpurge(
-        self,
-        ctx: commands.Context,
-        target: discord.Member,
-        timeframe: str,
-        all_channels: Optional[bool] = False,
-    ):
+    @commands.command(name="sinpurge", aliases=["purgeuser", "userpurge"])
+    async def sinpurge_prefix(self, ctx: commands.Context, *, args: str):
         """
         Purge recent messages from a specific user.
 
         Examples:
         [p]sinpurge @user 1h
-        [p]sinpurge @user 5h true
-        [p]sinpurge @user 2d false
+        [p]sinpurge username 1h all
+        [p]sinpurge User With Spaces 1h
+        [p]sinpurge 123456789012345678 1h all
         """
         if not ctx.guild or not isinstance(ctx.author, discord.Member):
             return await ctx.send("This command only works inside a server.")
+
+        try:
+            target_query, timeframe, all_channels = self.parse_prefix_args(args)
+            target = await self.resolve_member(ctx, target_query)
+        except (ValueError, commands.BadArgument) as error:
+            return await ctx.send(str(error))
 
         allowed, reason = self.can_use_against(ctx.author, target)
         if not allowed:
             return await ctx.send(reason)
 
-        all_channels = bool(all_channels)
-
-        try:
-            delta = self.parse_timeframe(timeframe)
-        except ValueError as error:
-            return await ctx.send(str(error))
-
-        started_message = (
+        await ctx.send(
             f"SIN Corp audit started for {target.mention}. "
             f"Searching the last `{timeframe}` "
             f"in {'all visible text channels' if all_channels else 'this channel'}."
         )
-
-        await ctx.send(started_message)
 
         try:
             deleted, scanned, skipped = await self.run_purge(
@@ -259,4 +330,69 @@ class SinPurge(commands.Cog):
 
         await ctx.send(
             f"Deleted `{deleted}` messages. Scanned `{scanned}` channel(s). Skipped `{skipped}` channel(s)."
+        )
+
+    @app_commands.command(name="sinpurge", description="Purge recent messages from a specific user.")
+    @app_commands.describe(
+        target="The user whose recent messages should be purged.",
+        timeframe="Time range. Max 14d.",
+        all_channels="Scan all text channels instead of only this channel."
+    )
+    @app_commands.choices(
+        timeframe=[
+            app_commands.Choice(name="Last 30 minutes", value="30m"),
+            app_commands.Choice(name="Last 1 hour", value="1h"),
+            app_commands.Choice(name="Last 5 hours", value="5h"),
+            app_commands.Choice(name="Last 12 hours", value="12h"),
+            app_commands.Choice(name="Last 1 day", value="1d"),
+            app_commands.Choice(name="Last 7 days", value="7d"),
+            app_commands.Choice(name="Last 14 days", value="14d"),
+        ]
+    )
+    async def sinpurge_slash(
+        self,
+        interaction: discord.Interaction,
+        target: discord.Member,
+        timeframe: app_commands.Choice[str],
+        all_channels: bool = False,
+    ):
+        guild = interaction.guild
+        moderator = interaction.user
+
+        if guild is None or not isinstance(moderator, discord.Member):
+            return await interaction.response.send_message("This command only works inside a server.", ephemeral=True)
+
+        if not moderator.guild_permissions.manage_messages:
+            return await interaction.response.send_message("You need `Manage Messages` to use this SIN Corp tool.", ephemeral=True)
+
+        if guild.me is None or not guild.me.guild_permissions.manage_messages:
+            return await interaction.response.send_message("I need `Manage Messages` to purge anything.", ephemeral=True)
+
+        allowed, reason = self.can_use_against(moderator, target)
+        if not allowed:
+            return await interaction.response.send_message(reason, ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            deleted, scanned, skipped = await self.run_purge(
+                guild=guild,
+                moderator=moderator,
+                target=target,
+                timeframe=timeframe.value,
+                all_channels=all_channels,
+                source_channel=interaction.channel,
+            )
+        except ValueError as error:
+            return await interaction.followup.send(str(error), ephemeral=True)
+
+        if deleted > 0 and interaction.channel is not None:
+            try:
+                await interaction.channel.send(self.lore_message(target, deleted))
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            f"SIN Corp audit complete. Deleted `{deleted}` messages. Scanned `{scanned}` channel(s). Skipped `{skipped}` channel(s).",
+            ephemeral=True,
         )
