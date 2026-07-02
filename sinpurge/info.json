@@ -1,0 +1,10 @@
+{
+  "author": ["PoutyJinx"],
+  "name": "SinPurge",
+  "short": "Purge recent messages from a specific user.",
+  "description": "SIN Corporation moderation tool for Red-DiscordBot. Purge recent messages from a specific user across one or all channels, including voice-channel chats and banned or left users by ID or exact name.",
+  "install_msg": "SIN Purge installed. Use `[p]sinpurge @user 1h`, `[p]sinpurge USER_ID 1h all`, or `/sinpurge`.",
+  "requirements": [],
+  "tags": ["moderation", "purge", "sin-corp"],
+  "min_bot_version": "3.5.0"
+}
