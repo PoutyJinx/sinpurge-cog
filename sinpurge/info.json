@@ -4,8 +4,8 @@
   ],
   "name": "SinPurge",
   "short": "Purge recent messages from a specific user.",
-  "description": "SIN Corporation moderation tool for Red-DiscordBot. Purge recent messages from a user across one or all channels, including voice-channel chats, banned or left users, and automatic 5-minute timeout for current members.",
-  "install_msg": "SIN Purge installed. Use `[p]sinpurge @user 1h`, `[p]sinpurge USER_ID 1h all`, or `/sinpurge`. Current members are automatically timed out for 5 minutes when permissions allow.",
+  "description": "SIN Corporation moderation tool for Red-DiscordBot. Purge recent messages from a user across one or all channels, including voice-channel chats, banned or left users, optional timeout durations, and configurable mod-log reports.",
+  "install_msg": "SIN Purge installed. Use `[p]sinpurge @user 1h`, `[p]sinpurge USER_ID 1h all none`, `/sinpurge`, and configure reports with `[p]sinpurgeset modlog #channel`.",
   "requirements": [],
   "tags": [
     "moderation",
